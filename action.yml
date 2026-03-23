@@ -24,6 +24,10 @@ inputs:
     description: "Wait for the ECS service deployment to reach a steady state"
     required: false
     default: "true"
+  wait-for-minutes:
+    description: "Minutes to wait for service stability before timing out. Only applies when wait-for-service-stability is true"
+    required: false
+    default: "10"
 
 outputs:
   task-definition-arn:
@@ -84,4 +88,64 @@ runs:
         task-definition: ${{ steps.render.outputs.task-definition }}
         service: ${{ inputs.service }}
         cluster: ${{ inputs.cluster }}
-        wait-for-service-stability: ${{ inputs.wait-for-service-stability }}
+        wait-for-service-stability: false
+
+    - name: Wait for deployment
+      if: ${{ inputs.wait-for-service-stability == 'true' }}
+      shell: bash
+      run: |
+        CLUSTER="${{ inputs.cluster }}"
+        SERVICE="${{ inputs.service }}"
+        TASK_DEF_ARN="${{ steps.deploy.outputs.task-definition-arn }}"
+        TIMEOUT=$(( ${{ inputs.wait-for-minutes }} * 60 ))
+        ELAPSED=0
+        INTERVAL=15
+
+        echo "Waiting for deployment of $TASK_DEF_ARN to stabilize (timeout: ${{ inputs.wait-for-minutes }}m)..."
+
+        while [[ $ELAPSED -lt $TIMEOUT ]]; do
+          DEPLOYMENTS=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].deployments' \
+            --output json)
+
+          # Find our deployment by task definition ARN
+          OUR_DEPLOYMENT=$(echo "$DEPLOYMENTS" | jq -r \
+            --arg arn "$TASK_DEF_ARN" \
+            '[.[] | select(.taskDefinition == $arn)][0] // empty')
+
+          if [[ -z "$OUR_DEPLOYMENT" || "$OUR_DEPLOYMENT" == "null" ]]; then
+            echo "::error::Deployment not found. It may have been rolled back."
+            exit 1
+          fi
+
+          STATUS=$(echo "$OUR_DEPLOYMENT" | jq -r '.status')
+          ROLLOUT=$(echo "$OUR_DEPLOYMENT" | jq -r '.rolloutState // "N/A"')
+          RUNNING=$(echo "$OUR_DEPLOYMENT" | jq -r '.runningCount')
+          DESIRED=$(echo "$OUR_DEPLOYMENT" | jq -r '.desiredCount')
+
+          echo "Status: $STATUS | Rollout: $ROLLOUT | Running: $RUNNING/$DESIRED | Elapsed: ${ELAPSED}s"
+
+          if [[ "$ROLLOUT" == "COMPLETED" ]]; then
+            echo "Deployment completed successfully"
+            exit 0
+          fi
+
+          if [[ "$ROLLOUT" == "FAILED" ]]; then
+            REASON=$(echo "$OUR_DEPLOYMENT" | jq -r '.rolloutStateReason // "unknown"')
+            echo "::error::Deployment failed: $REASON"
+            exit 1
+          fi
+
+          if [[ "$STATUS" == "INACTIVE" ]]; then
+            echo "::error::Deployment became inactive (rolled back by circuit breaker)"
+            exit 1
+          fi
+
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
+
+        echo "::error::Deployment timed out after ${{ inputs.wait-for-minutes }} minutes"
+        exit 1
