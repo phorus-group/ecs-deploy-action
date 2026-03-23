@@ -1,0 +1,87 @@
+name: ECS Deploy Action
+description: Updates a container image in an ECS task definition and deploys it to an ECS service using official AWS actions
+
+inputs:
+  task-definition-family:
+    description: "ECS task definition family name"
+    required: true
+  container-name:
+    description: "Name of the container to update within the task definition"
+    required: true
+  image:
+    description: "Full image URI (e.g. ghcr.io/org/repo:v1.0.0). Takes precedence over image-tag"
+    required: false
+  image-tag:
+    description: "Image tag only (e.g. v1.0.0 or abc1234). Will be combined with the container's current image repository from the existing task definition. Ignored if 'image' is provided"
+    required: false
+  cluster:
+    description: "ECS cluster name or ARN"
+    required: true
+  service:
+    description: "ECS service name"
+    required: true
+  wait-for-service-stability:
+    description: "Wait for the ECS service deployment to reach a steady state"
+    required: false
+    default: "true"
+
+outputs:
+  task-definition-arn:
+    description: "Full ARN of the newly registered task definition"
+    value: ${{ steps.deploy.outputs.task-definition-arn }}
+  service:
+    description: "The name of the deployed ECS service"
+    value: ${{ steps.deploy.outputs.service }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [[ -z "${{ inputs.image }}" && -z "${{ inputs.image-tag }}" ]]; then
+          echo "::error::Either 'image' (full URI) or 'image-tag' must be provided"
+          exit 1
+        fi
+
+    - name: Resolve image URI from tag
+      id: resolve-image
+      if: ${{ inputs.image == '' && inputs.image-tag != '' }}
+      shell: bash
+      run: |
+        TASK_DEF=$(aws ecs describe-task-definition \
+          --task-definition "${{ inputs.task-definition-family }}" \
+          --query 'taskDefinition' \
+          --output json)
+
+        CURRENT_IMAGE=$(echo "$TASK_DEF" | jq -r \
+          --arg name "${{ inputs.container-name }}" \
+          '.containerDefinitions[] | select(.name == $name) | .image')
+
+        if [[ -z "$CURRENT_IMAGE" || "$CURRENT_IMAGE" == "null" ]]; then
+          echo "::error::Container '${{ inputs.container-name }}' not found in task definition '${{ inputs.task-definition-family }}'"
+          exit 1
+        fi
+
+        IMAGE_BASE="${CURRENT_IMAGE%:*}"
+        NEW_IMAGE="${IMAGE_BASE}:${{ inputs.image-tag }}"
+
+        echo "image=$NEW_IMAGE" >> $GITHUB_OUTPUT
+        echo "Resolved image: $CURRENT_IMAGE -> $NEW_IMAGE"
+
+    - name: Render task definition with new image
+      id: render
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition-family: ${{ inputs.task-definition-family }}
+        container-name: ${{ inputs.container-name }}
+        image: ${{ inputs.image || steps.resolve-image.outputs.image }}
+
+    - name: Deploy to ECS service
+      id: deploy
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.render.outputs.task-definition }}
+        service: ${{ inputs.service }}
+        cluster: ${{ inputs.cluster }}
+        wait-for-service-stability: ${{ inputs.wait-for-service-stability }}
